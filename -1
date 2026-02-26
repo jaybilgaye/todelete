@@ -1,0 +1,403 @@
+Below is a full ClickHouse Storage Health Diagnostic Query Pack you can paste into your SQL client. It’s designed for multi-node clusters (works best with clusterAllReplicas()), and also includes single-node versions.
+
+> Replace:
+
+'{CLUSTER}' with your cluster name (from system.clusters)
+
+optionally filter database NOT IN (...) to ignore system DBs
+
+
+
+
+
+---
+
+0) Discover cluster name (and sanity check)
+
+SELECT cluster, shard_num, replica_num, host_name, host_address, port
+FROM system.clusters
+ORDER BY cluster, shard_num, replica_num;
+
+
+---
+
+A) Disk & Volume Health
+
+A1) Disk free/used per node (cluster)
+
+SELECT
+    hostName() AS host,
+    name AS disk,
+    formatReadableSize(total_space) AS total,
+    formatReadableSize(free_space) AS free,
+    formatReadableSize(total_space - free_space) AS used,
+    round((total_space - free_space) / total_space * 100, 2) AS used_pct
+FROM clusterAllReplicas('{CLUSTER}', system.disks)
+ORDER BY used_pct DESC, host, disk;
+
+A2) Database directories & storage paths (local node)
+
+SELECT name, path
+FROM system.databases
+ORDER BY name;
+
+
+---
+
+B) Top Storage Consumers
+
+B1) Table sizes (cluster) — the main one
+
+SELECT
+    database,
+    table,
+    formatReadableSize(sum(bytes_on_disk)) AS size_on_disk,
+    formatReadableSize(sum(data_compressed_bytes)) AS compressed,
+    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
+    round(sum(data_uncompressed_bytes) / NULLIF(sum(data_compressed_bytes), 0), 2) AS compression_ratio,
+    sum(rows) AS rows,
+    count() AS active_parts
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 200;
+
+B2) Database sizes (cluster)
+
+SELECT
+    database,
+    formatReadableSize(sum(bytes_on_disk)) AS db_size_on_disk,
+    sum(rows) AS rows
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database
+ORDER BY sum(bytes_on_disk) DESC;
+
+B3) Biggest partitions (cluster)
+
+SELECT
+    database,
+    table,
+    partition,
+    formatReadableSize(sum(bytes_on_disk)) AS partition_size,
+    sum(rows) AS rows,
+    count() AS parts
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table, partition
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 200;
+
+
+---
+
+C) Merge Health (parts explosion / fragmentation)
+
+C1) Tables with too many active parts (cluster)
+
+SELECT
+    database,
+    table,
+    count() AS active_parts,
+    formatReadableSize(sum(bytes_on_disk)) AS size_on_disk
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table
+HAVING active_parts > 500
+ORDER BY active_parts DESC;
+
+C2) Merge queue / merge pressure (cluster)
+
+SELECT
+    hostName() AS host,
+    database,
+    table,
+    count() AS merges_in_queue,
+    sum(elapsed) AS total_elapsed_s
+FROM clusterAllReplicas('{CLUSTER}', system.merges)
+GROUP BY host, database, table
+ORDER BY merges_in_queue DESC, total_elapsed_s DESC
+LIMIT 200;
+
+C3) Background pool saturation hints (local node)
+
+SELECT *
+FROM system.metrics
+WHERE metric IN
+(
+ 'BackgroundMergesAndMutationsPoolTask',
+ 'BackgroundMergesAndMutationsPoolSize',
+ 'BackgroundFetchesPoolTask',
+ 'BackgroundFetchesPoolSize'
+)
+ORDER BY metric;
+
+
+---
+
+D) Replication & Fetch Health (storage divergence, replica lag)
+
+D1) Replication queue backlog (cluster)
+
+SELECT
+    hostName() AS host,
+    database,
+    table,
+    is_leader,
+    queue_size,
+    inserts_in_queue,
+    merges_in_queue,
+    log_max_index - log_pointer AS log_lag,
+    absolute_delay,
+    total_replicas,
+    active_replicas
+FROM clusterAllReplicas('{CLUSTER}', system.replicas)
+WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+ORDER BY absolute_delay DESC, queue_size DESC
+LIMIT 200;
+
+D2) Parts not on all replicas (cluster) — “missing parts” symptoms
+
+SELECT
+    database,
+    table,
+    countDistinct(hostName()) AS replicas_with_parts,
+    count() AS part_rows
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table
+ORDER BY replicas_with_parts ASC
+LIMIT 200;
+
+(If you have 2 replicas and see replicas_with_parts = 1, you likely have fetch/replication issues.)
+
+
+---
+
+E) Mutations (ALTER/UPDATE/DELETE) & Storage Bloat
+
+E1) Mutation backlog (cluster) — very relevant if you see huge “not merged”
+
+SELECT
+    hostName() AS host,
+    database,
+    table,
+    mutation_id,
+    command,
+    create_time,
+    is_done,
+    parts_to_do,
+    latest_failed_part,
+    latest_fail_time,
+    latest_fail_reason
+FROM clusterAllReplicas('{CLUSTER}', system.mutations)
+WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+  AND is_done = 0
+ORDER BY parts_to_do DESC, create_time ASC
+LIMIT 200;
+
+E2) “Rows vs bytes” skew (spot bloaty tables)
+
+SELECT
+    database,
+    table,
+    sum(rows) AS rows,
+    formatReadableSize(sum(bytes_on_disk)) AS size_on_disk,
+    round(sum(bytes_on_disk) / NULLIF(sum(rows), 0), 2) AS bytes_per_row
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table
+ORDER BY bytes_per_row DESC
+LIMIT 200;
+
+
+---
+
+F) TTL Health (cleanup backlog / disk not freeing)
+
+F1) TTL merges in progress (cluster)
+
+SELECT
+    hostName() AS host,
+    database,
+    table,
+    elapsed,
+    progress,
+    num_parts,
+    formatReadableSize(total_size_bytes_compressed) AS total_compressed,
+    formatReadableSize(total_size_bytes_uncompressed) AS total_uncompressed
+FROM clusterAllReplicas('{CLUSTER}', system.ttl_merges)
+ORDER BY elapsed DESC
+LIMIT 200;
+
+F2) Check if tables have TTL defined (local node)
+
+SELECT
+    database,
+    name AS table,
+    engine,
+    ttl_table,
+    ttl_moves,
+    ttl_recompress
+FROM system.tables
+WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+  AND (ttl_table != '' OR ttl_moves != '' OR ttl_recompress != '')
+ORDER BY database, table;
+
+
+---
+
+G) Detached / Broken Parts (hidden disk consumers)
+
+G1) Detached parts (cluster) — common reason disk stays high
+
+SELECT
+    hostName() AS host,
+    database,
+    table,
+    count() AS detached_parts,
+    formatReadableSize(sum(bytes_on_disk)) AS detached_size
+FROM clusterAllReplicas('{CLUSTER}', system.detached_parts)
+WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY host, database, table
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 200;
+
+G2) “Unexpected” directories under data path (local node, use cautiously)
+
+If you can run shell on host:
+
+check /var/lib/clickhouse/store/ or your CH path for large leftovers
+
+
+(If you want, tell me your ClickHouse path from system.databases and I’ll give exact du commands.)
+
+
+---
+
+H) Storage by Disk / Volume (multi-disk setups)
+
+H1) Table bytes by disk (cluster)
+
+SELECT
+    hostName() AS host,
+    disk_name,
+    database,
+    table,
+    formatReadableSize(sum(bytes_on_disk)) AS size_on_disk
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY host, disk_name, database, table
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 300;
+
+
+---
+
+I) “Am I healthy?” Quick Scorecard (cluster)
+
+This is a compact “alert-style” view:
+
+WITH
+rep AS (
+    SELECT
+        hostName() AS host,
+        sum(queue_size) AS repl_queue,
+        max(absolute_delay) AS repl_delay_s,
+        sum(log_max_index - log_pointer) AS repl_log_lag
+    FROM clusterAllReplicas('{CLUSTER}', system.replicas)
+    WHERE database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+    GROUP BY host
+),
+mut AS (
+    SELECT
+        hostName() AS host,
+        count() AS pending_mutations,
+        sum(parts_to_do) AS mutation_parts_to_do
+    FROM clusterAllReplicas('{CLUSTER}', system.mutations)
+    WHERE is_done = 0
+      AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+    GROUP BY host
+),
+disk AS (
+    SELECT
+        hostName() AS host,
+        round(max((total_space - free_space) / total_space * 100), 2) AS max_disk_used_pct
+    FROM clusterAllReplicas('{CLUSTER}', system.disks)
+    GROUP BY host
+),
+mer AS (
+    SELECT
+        hostName() AS host,
+        count() AS merges_running
+    FROM clusterAllReplicas('{CLUSTER}', system.merges)
+    GROUP BY host
+)
+SELECT
+    d.host,
+    d.max_disk_used_pct,
+    coalesce(r.repl_queue, 0) AS repl_queue,
+    coalesce(r.repl_delay_s, 0) AS repl_delay_s,
+    coalesce(r.repl_log_lag, 0) AS repl_log_lag,
+    coalesce(m.pending_mutations, 0) AS pending_mutations,
+    coalesce(m.mutation_parts_to_do, 0) AS mutation_parts_to_do,
+    coalesce(me.merges_running, 0) AS merges_running
+FROM disk d
+LEFT JOIN rep r ON r.host = d.host
+LEFT JOIN mut m ON m.host = d.host
+LEFT JOIN mer me ON me.host = d.host
+ORDER BY d.max_disk_used_pct DESC, repl_delay_s DESC, pending_mutations DESC;
+
+
+---
+
+J) Single-node versions (if you’re debugging one host)
+
+Just replace clusterAllReplicas('{CLUSTER}', system.X) with system.X.
+
+Example (single node table size):
+
+SELECT
+    database, table,
+    formatReadableSize(sum(bytes_on_disk)) AS size_on_disk,
+    sum(rows) AS rows,
+    count() AS active_parts
+FROM system.parts
+WHERE active
+GROUP BY database, table
+ORDER BY sum(bytes_on_disk) DESC;
+
+
+---
+
+If you want this pack “production-ready” for your exact setup
+
+Send me:
+
+1. Output of:
+
+
+
+SELECT DISTINCT cluster FROM system.clusters;
+
+2. Your replica engine type (usually ReplicatedMergeTree) for 1 big table:
+
+
+
+SHOW CREATE TABLE db.table;
+
+…and I’ll tailor:
+
+thresholds (parts > X, disk used > Y%)
+
+a “top offenders” dashboard query
+
+a disk-not-dropping playbook (TTL, detached parts, mutations, merges, replication fetch) for your environment.
