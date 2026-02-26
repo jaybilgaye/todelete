@@ -1,0 +1,409 @@
+Perfect. Now we’re doing this properly.
+
+You want:
+
+> Logical storage monitoring
+(Deduplicated across replicas — i.e., true data size, not double-counted physical disk)
+
+
+
+This is what capacity planning teams actually care about.
+
+
+---
+
+🎯 First: What “Logical” Means in ClickHouse
+
+If you have:
+
+1 shard
+
+2 replicas
+
+
+Physical size ≈ 2× logical size
+Logical size = data stored per shard (replicas ignored)
+
+So instead of clusterAllReplicas(), we must:
+
+Deduplicate replicas
+
+Count only one copy per shard
+
+
+
+---
+
+🏗 Production Implementation Plan — Logical Storage Monitoring
+
+We’ll design:
+
+1. Schema
+
+
+2. Logical collector query
+
+
+3. Dedup strategy
+
+
+4. Scheduling
+
+
+5. Retention
+
+
+6. Alerting
+
+
+7. Validation
+
+
+
+
+---
+
+1️⃣ Architecture Overview
+
+ClickHouse Cluster
+        ↓
+system.parts (clusterAllReplicas)
+        ↓
+Deduplicate per (shard, part)
+        ↓
+monitoring.table_storage_history_logical
+        ↓
+Grafana / API / Dashboards
+
+
+---
+
+2️⃣ Why Deduplication is Needed
+
+system.parts contains:
+
+Same part replicated across replicas
+
+Same part_name
+
+Same partition
+
+Same rows
+
+
+We must:
+
+Group by shard
+
+Count each part only once
+
+
+
+---
+
+3️⃣ Step 1 — Create Monitoring DB
+
+CREATE DATABASE IF NOT EXISTS monitoring ON CLUSTER '{CLUSTER}';
+
+
+---
+
+4️⃣ Step 2 — Create Logical History Table
+
+CREATE TABLE IF NOT EXISTS monitoring.table_storage_history_logical
+ON CLUSTER '{CLUSTER}'
+(
+    ts DateTime CODEC(Delta, ZSTD(3)),
+
+    database LowCardinality(String),
+    table LowCardinality(String),
+
+    logical_bytes UInt64 CODEC(Delta, ZSTD(3)),
+    rows UInt64 CODEC(Delta, ZSTD(3)),
+    active_parts UInt32 CODEC(Delta, ZSTD(3)),
+
+    compressed_bytes UInt64 CODEC(Delta, ZSTD(3)),
+    uncompressed_bytes UInt64 CODEC(Delta, ZSTD(3)),
+    compression_ratio Float32 CODEC(ZSTD(3))
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (database, table, ts);
+
+Retention:
+
+ALTER TABLE monitoring.table_storage_history_logical
+ON CLUSTER '{CLUSTER}'
+MODIFY TTL ts + INTERVAL 180 DAY;
+
+
+---
+
+5️⃣ Step 3 — Logical Collector Query (Deduplicated Across Replicas)
+
+This is the important part.
+
+🔥 Logical Snapshot Query
+
+INSERT INTO monitoring.table_storage_history_logical
+SELECT
+    toStartOfMinute(now()) AS ts,
+    database,
+    table,
+    sum(bytes_on_disk) AS logical_bytes,
+    sum(rows) AS rows,
+    count() AS active_parts,
+    sum(data_compressed_bytes) AS compressed_bytes,
+    sum(data_uncompressed_bytes) AS uncompressed_bytes,
+    if(sum(data_compressed_bytes)=0, 0,
+       sum(data_uncompressed_bytes) / sum(data_compressed_bytes)) AS compression_ratio
+FROM
+(
+    SELECT
+        database,
+        table,
+        partition,
+        name,
+        any(bytes_on_disk) AS bytes_on_disk,
+        any(rows) AS rows,
+        any(data_compressed_bytes) AS data_compressed_bytes,
+        any(data_uncompressed_bytes) AS data_uncompressed_bytes
+    FROM clusterAllReplicas('{CLUSTER}', system.parts)
+    WHERE active
+      AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+    GROUP BY
+        database,
+        table,
+        partition,
+        name
+)
+GROUP BY database, table;
+
+
+---
+
+🧠 Why This Works
+
+We deduplicate by:
+
+GROUP BY database, table, partition, name
+
+name = part name
+Replicas have identical part names.
+
+Using:
+
+any(bytes_on_disk)
+
+We take one copy only.
+
+Thus:
+
+Logical size = unique parts only.
+
+
+---
+
+6️⃣ Step 4 — Scheduling (Production)
+
+Use systemd timer (recommended).
+
+Run every 10 minutes.
+
+This is light-weight because:
+
+system.parts is metadata
+
+No table scanning
+
+Safe for production
+
+
+
+---
+
+7️⃣ Validation (Very Important)
+
+After first run:
+
+Compare physical vs logical
+
+-- Physical
+SELECT sum(bytes_on_disk)
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active;
+
+-- Logical
+SELECT sum(logical_bytes)
+FROM monitoring.table_storage_history_logical
+WHERE ts = (SELECT max(ts) FROM monitoring.table_storage_history_logical);
+
+If you have 2 replicas:
+
+Physical ≈ 2 × Logical
+
+If that matches → correct.
+
+
+---
+
+8️⃣ Production Hardening Checklist
+
+✅ Use dedicated monitoring user
+✅ Use time bucket (toStartOfMinute)
+✅ TTL retention
+✅ Run from only ONE node
+✅ Alert if insert fails
+✅ Monitor insert latency
+
+
+---
+
+9️⃣ Queries for Logical Monitoring
+
+
+---
+
+Current Logical Table Size
+
+SELECT
+  database,
+  table,
+  formatReadableSize(logical_bytes) AS logical_size,
+  rows,
+  active_parts
+FROM monitoring.table_storage_history_logical
+WHERE ts = (SELECT max(ts) FROM monitoring.table_storage_history_logical)
+ORDER BY logical_bytes DESC
+LIMIT 200;
+
+
+---
+
+Logical Growth Last 24h
+
+WITH
+latest AS (SELECT max(ts) AS t1 FROM monitoring.table_storage_history_logical),
+prev AS (
+  SELECT max(ts) AS t0
+  FROM monitoring.table_storage_history_logical
+  WHERE ts <= (SELECT t1 FROM latest) - INTERVAL 24 HOUR
+)
+SELECT
+  cur.database,
+  cur.table,
+  formatReadableSize(cur.logical_bytes - prev.logical_bytes) AS growth_24h,
+  round((cur.logical_bytes - prev.logical_bytes) / prev.logical_bytes * 100, 2) AS growth_pct
+FROM
+(
+  SELECT database, table, logical_bytes
+  FROM monitoring.table_storage_history_logical
+  WHERE ts = (SELECT t1 FROM latest)
+) cur
+LEFT JOIN
+(
+  SELECT database, table, logical_bytes
+  FROM monitoring.table_storage_history_logical
+  WHERE ts = (SELECT t0 FROM prev)
+) prev
+USING (database, table)
+ORDER BY (cur.logical_bytes - prev.logical_bytes) DESC
+LIMIT 100;
+
+
+---
+
+Logical Trend (Hourly)
+
+SELECT
+  toStartOfHour(ts) AS hour,
+  database,
+  table,
+  formatReadableSize(avg(logical_bytes)) AS avg_size
+FROM monitoring.table_storage_history_logical
+WHERE ts >= now() - INTERVAL 7 DAY
+GROUP BY hour, database, table
+ORDER BY hour;
+
+
+---
+
+10️⃣ Alerting Strategy (Logical)
+
+You should alert if:
+
+Growth > 20% in 24h
+
+Table > 1TB
+
+active_parts > 1000
+
+compression_ratio < 2
+
+
+
+---
+
+11️⃣ Capacity Planning Query
+
+Predict days to full:
+
+SELECT
+  database,
+  table,
+  max(logical_bytes) - min(logical_bytes) AS growth_last_7d,
+  (max(logical_bytes) - min(logical_bytes)) / 7 AS avg_daily_growth
+FROM monitoring.table_storage_history_logical
+WHERE ts >= now() - INTERVAL 7 DAY
+GROUP BY database, table;
+
+
+---
+
+🔥 Important Production Note
+
+This works perfectly for:
+
+ReplicatedMergeTree
+
+1 shard / N replicas
+
+Multi-shard clusters
+
+
+Because dedupe happens at part level.
+
+
+---
+
+🚀 Final Reality Check
+
+Logical storage monitoring is what:
+
+Capacity planning teams want
+
+Finance teams care about
+
+Cloud cost forecasting depends on
+
+
+Physical storage monitoring is what:
+
+Infra/SRE teams care about
+
+
+Best practice: Run both.
+
+
+---
+
+If you tell me:
+
+How many shards?
+
+How many replicas?
+
+Average table count?
+
+
+I’ll optimize the query further for your exact topology.
