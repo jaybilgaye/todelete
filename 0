@@ -1,0 +1,430 @@
+Below is a production-level implementation doc for a ClickHouse Monitoring DB that stores historical table storage + table stats, plus a separate query pack you can keep as a toolbox.
+
+I’m assuming you want this to work cleanly on a cluster (like your 12 nodes, 1 shard / 2 replicas). I’ll give you two designs:
+
+Design A (Recommended): Cluster-aggregated snapshots (small data, easy trend)
+
+Design B: Per-host snapshots (more detail, detects replica/disk imbalance)
+
+
+
+---
+
+Production Doc: Monitoring DB for Storage + Table Stats
+
+1) What you’ll get
+
+You will be able to answer questions like:
+
+“Which tables grew most in last 24h / 7d?”
+
+“What’s my storage trend per DB/table?”
+
+“Which tables have parts explosion / merge pressure?”
+
+“Which replicas are diverging in disk usage?”
+
+“How much bloat from mutations / TTL backlog?”
+
+
+
+---
+
+2) Create a dedicated monitoring database
+
+Create it everywhere (or via cluster DDL):
+
+CREATE DATABASE IF NOT EXISTS monitoring;
+
+If you prefer cluster-wide DDL:
+
+CREATE DATABASE IF NOT EXISTS monitoring ON CLUSTER '{CLUSTER}';
+
+
+---
+
+3) Choose your snapshot granularity
+
+✅ Design A (Recommended): Cluster-aggregated snapshots
+
+You store one row per (time bucket, database, table) where sizes are summed across replicas.
+
+Pros:
+
+Small storage footprint
+
+Fast queries
+
+Perfect for trend dashboards
+
+
+Cons:
+
+Harder to debug “replica A is larger than replica B”
+
+
+Design B: Per-host snapshots
+
+You store one row per (time bucket, host, database, table)
+
+Pros:
+
+Detects imbalance, divergence, weird disks
+
+Good for incident debugging
+
+
+Cons:
+
+More rows (hosts × tables × time)
+
+
+My advice: start with A, add B later if needed.
+
+
+---
+
+4) Schema (Production-ready)
+
+4.1 Design A table: cluster-wide table storage history
+
+CREATE TABLE IF NOT EXISTS monitoring.table_storage_history_cluster
+(
+    ts DateTime CODEC(Delta, ZSTD(3)),
+    database LowCardinality(String),
+    table LowCardinality(String),
+
+    bytes_on_disk UInt64 CODEC(Delta, ZSTD(3)),
+    rows UInt64 CODEC(Delta, ZSTD(3)),
+    active_parts UInt32 CODEC(Delta, ZSTD(3)),
+
+    compressed_bytes UInt64 CODEC(Delta, ZSTD(3)),
+    uncompressed_bytes UInt64 CODEC(Delta, ZSTD(3)),
+    compression_ratio Float32 CODEC(ZSTD(3))
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (database, table, ts);
+
+Retention (90 days):
+
+ALTER TABLE monitoring.table_storage_history_cluster
+MODIFY TTL ts + INTERVAL 90 DAY;
+
+
+---
+
+4.2 Design B table: per-host history (optional)
+
+CREATE TABLE IF NOT EXISTS monitoring.table_storage_history_host
+(
+    ts DateTime CODEC(Delta, ZSTD(3)),
+    host LowCardinality(String),
+    disk LowCardinality(String),
+
+    database LowCardinality(String),
+    table LowCardinality(String),
+
+    bytes_on_disk UInt64 CODEC(Delta, ZSTD(3)),
+    rows UInt64 CODEC(Delta, ZSTD(3)),
+    active_parts UInt32 CODEC(Delta, ZSTD(3))
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (host, database, table, ts);
+
+Retention:
+
+ALTER TABLE monitoring.table_storage_history_host
+MODIFY TTL ts + INTERVAL 30 DAY;
+
+(Host-level usually needs shorter retention.)
+
+
+---
+
+5) Snapshot collection queries (the “collector”)
+
+5.1 Insert into Design A (Cluster-aggregated)
+
+Run from any one node (or your “leader” node):
+
+INSERT INTO monitoring.table_storage_history_cluster
+SELECT
+    now() AS ts,
+    database,
+    table,
+    sum(bytes_on_disk) AS bytes_on_disk,
+    sum(rows) AS rows,
+    count() AS active_parts,
+    sum(data_compressed_bytes) AS compressed_bytes,
+    sum(data_uncompressed_bytes) AS uncompressed_bytes,
+    if(sum(data_compressed_bytes)=0, 0, sum(data_uncompressed_bytes) / sum(data_compressed_bytes)) AS compression_ratio
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table;
+
+> Note: clusterAllReplicas() includes replicas, so your “cluster size” will reflect replicas too.
+If you want logical size (per shard, not double-counted) we can adjust (tell me and I’ll give the correct version).
+
+
+
+
+---
+
+5.2 Insert into Design B (Per-host)
+
+INSERT INTO monitoring.table_storage_history_host
+SELECT
+    now() AS ts,
+    hostName() AS host,
+    disk_name AS disk,
+    database,
+    table,
+    sum(bytes_on_disk) AS bytes_on_disk,
+    sum(rows) AS rows,
+    count() AS active_parts
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY host, disk, database, table;
+
+
+---
+
+6) Scheduling in production (simple + reliable)
+
+Option 1: cron (most common)
+
+Run every 10 minutes:
+
+/etc/cron.d/ch_storage_snapshot
+
+*/10 * * * * clickhouse clickhouse-client --host 127.0.0.1 --multiquery --query "
+INSERT INTO monitoring.table_storage_history_cluster
+SELECT now(), database, table, sum(bytes_on_disk), sum(rows), count(),
+       sum(data_compressed_bytes), sum(data_uncompressed_bytes),
+       if(sum(data_compressed_bytes)=0,0,sum(data_uncompressed_bytes)/sum(data_compressed_bytes))
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table;
+"
+
+Option 2: systemd timer (better than cron)
+
+retries, logging, easier ops
+If you want, tell me your OS (Ubuntu/RHEL) and I’ll give exact .service + .timer.
+
+
+
+---
+
+7) Operational hardening checklist
+
+Do these for “prod-level” quality:
+
+1. Use a dedicated monitoring user
+
+
+
+INSERT into monitoring tables
+
+SELECT on system.parts, etc.
+
+
+2. Guard against duplicate inserts
+
+
+
+Easiest: bucket timestamps (toStartOfMinute(now())) so duplicates overwrite logically (or you can de-dupe in queries).
+
+If you want strict de-dupe, we can design with ReplacingMergeTree(ts, version).
+
+
+3. Limit scope
+
+
+
+Exclude heavy DBs if needed or only include selected DBs first.
+
+
+4. Retention
+
+
+
+Apply TTLs. Monitoring data should never grow forever.
+
+
+5. Alerting
+
+
+
+Disk > 80%
+
+Growth spikes
+
+active_parts explosion
+
+mutation backlog
+
+
+
+---
+
+Query Pack: Table Stats (Current + Historical)
+
+A) Current table size (single node)
+
+SELECT
+  database,
+  table,
+  formatReadableSize(sum(bytes_on_disk)) AS size,
+  sum(rows) AS rows,
+  count() AS active_parts
+FROM system.parts
+WHERE active
+GROUP BY database, table
+ORDER BY sum(bytes_on_disk) DESC;
+
+B) Current table size (cluster)
+
+SELECT
+  database,
+  table,
+  formatReadableSize(sum(bytes_on_disk)) AS cluster_size,
+  sum(rows) AS rows,
+  count() AS active_parts
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+  AND database NOT IN ('system','information_schema','INFORMATION_SCHEMA')
+GROUP BY database, table
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 200;
+
+C) Compression ratio (cluster)
+
+SELECT
+  database,
+  table,
+  round(sum(data_uncompressed_bytes) / NULLIF(sum(data_compressed_bytes),0), 2) AS compression_ratio,
+  formatReadableSize(sum(data_compressed_bytes)) AS compressed,
+  formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+GROUP BY database, table
+ORDER BY compression_ratio DESC
+LIMIT 200;
+
+D) Tables with too many parts (merge/fragmentation risk)
+
+SELECT
+  database,
+  table,
+  count() AS active_parts,
+  formatReadableSize(sum(bytes_on_disk)) AS size
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+GROUP BY database, table
+HAVING active_parts > 500
+ORDER BY active_parts DESC;
+
+E) Biggest partitions (cluster)
+
+SELECT
+  database,
+  table,
+  partition,
+  formatReadableSize(sum(bytes_on_disk)) AS partition_size,
+  sum(rows) AS rows,
+  count() AS parts
+FROM clusterAllReplicas('{CLUSTER}', system.parts)
+WHERE active
+GROUP BY database, table, partition
+ORDER BY sum(bytes_on_disk) DESC
+LIMIT 200;
+
+
+---
+
+F) Historical: Trend for one table (hourly)
+
+(Uses monitoring DB, Design A)
+
+SELECT
+  toStartOfHour(ts) AS hour,
+  formatReadableSize(avg(bytes_on_disk)) AS avg_size
+FROM monitoring.table_storage_history_cluster
+WHERE database = 'YOUR_DB'
+  AND table = 'YOUR_TABLE'
+  AND ts >= now() - INTERVAL 7 DAY
+GROUP BY hour
+ORDER BY hour;
+
+G) Historical: Top growers in last 24h (cluster)
+
+WITH
+latest AS (SELECT max(ts) AS t1 FROM monitoring.table_storage_history_cluster),
+prev AS (
+  SELECT max(ts) AS t0
+  FROM monitoring.table_storage_history_cluster
+  WHERE ts <= (SELECT t1 FROM latest) - INTERVAL 24 HOUR
+)
+SELECT
+  cur.database,
+  cur.table,
+  formatReadableSize(cur.bytes) AS size_now,
+  formatReadableSize(prev.bytes) AS size_24h_ago,
+  formatReadableSize(cur.bytes - prev.bytes) AS growth_24h,
+  round((cur.bytes - prev.bytes) / NULLIF(prev.bytes, 0) * 100, 2) AS growth_pct
+FROM
+(
+  SELECT database, table, bytes_on_disk AS bytes
+  FROM monitoring.table_storage_history_cluster
+  WHERE ts = (SELECT t1 FROM latest)
+) cur
+LEFT JOIN
+(
+  SELECT database, table, bytes_on_disk AS bytes
+  FROM monitoring.table_storage_history_cluster
+  WHERE ts = (SELECT t0 FROM prev)
+) prev
+ON cur.database = prev.database AND cur.table = prev.table
+ORDER BY (cur.bytes - coalesce(prev.bytes, 0)) DESC
+LIMIT 100;
+
+H) Historical: Daily sizes (last 30 days)
+
+SELECT
+  toDate(ts) AS day,
+  database,
+  table,
+  formatReadableSize(avg(bytes_on_disk)) AS avg_size
+FROM monitoring.table_storage_history_cluster
+WHERE ts >= now() - INTERVAL 30 DAY
+GROUP BY day, database, table
+ORDER BY day, avg(bytes_on_disk) DESC;
+
+
+---
+
+What I need from you to tailor this perfectly
+
+Reply with:
+
+1. your cluster name:
+
+
+
+SELECT DISTINCT cluster FROM system.clusters;
+
+2. Do you want storage to be:
+
+
+
+Physical (includes replicas), or
+
+Logical (deduplicated across replicas)
+
+
+Because that choice changes the “cluster size” query. I can give you the exact “logical size across cluster” version once you confirm.
