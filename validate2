@@ -1,0 +1,248 @@
+Below is a complete production-ready DAG file for your job using the architecture we discussed:
+
+• SparkSubmitOperator
+• env variables loaded from env_subscriber (Method 2)
+• Spark configs stored in a properties_file (recommended for your ~40 configs)
+
+This keeps the DAG clean and maintainable.
+
+
+---
+
+📄 DAG File
+
+Create file:
+
+/app/airflow/airflow/dags/omega_iplogs_spark_dag.py
+
+
+---
+
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime
+
+
+# ----------------------------------------------------
+# Function to load env variables from env_subscriber
+# ----------------------------------------------------
+def load_env_file(file_path):
+
+    env_vars = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+
+# ----------------------------------------------------
+# Load environment variables
+# ----------------------------------------------------
+env_vars = load_env_file(
+    "/opt/telstra/omega/omega-common-files/env_subscriber"
+)
+
+
+# ----------------------------------------------------
+# DAG definition
+# ----------------------------------------------------
+with DAG(
+
+    dag_id="omega_iplogs_streaming",
+
+    start_date=datetime(2026, 1, 1),
+
+    schedule_interval=None,
+
+    catchup=False,
+
+    tags=["spark", "omega", "iplogs"]
+
+) as dag:
+
+
+    spark_submit_job = SparkSubmitOperator(
+
+        task_id="submit_omega_iplogs",
+
+        conn_id="spark_yarn",
+
+        # -----------------------------------------
+        # Spark Application
+        # -----------------------------------------
+        application="/opt/telstra/omega/internetrequestquery/current/irqf.jar",
+
+        java_class="com.telstra.omega.process.omegaProcessRequest",
+
+        name="omega-IRqF-internetRequest-iplogs",
+
+
+        # -----------------------------------------
+        # Spark properties file (contains 40 confs)
+        # -----------------------------------------
+        properties_file="/opt/telstra/omega/config/iplogs_spark.properties",
+
+
+        # -----------------------------------------
+        # Additional dependency jars
+        # -----------------------------------------
+        jars="""
+/opt/telstra/omega/internetrequestquery/current/spark-internetRequest.jar,
+/app/hbase/lib/hbase-client.jar,
+/app/cluster-essentials/*
+""",
+
+
+        # -----------------------------------------
+        # Files shipped to executors
+        # -----------------------------------------
+        files="""
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-executor.properties,
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-driver.properties,
+/opt/hbase/conf/hbase-site.xml
+""",
+
+
+        # -----------------------------------------
+        # Spark resources
+        # -----------------------------------------
+        executor_memory="5g",
+
+        executor_cores=2,
+
+        num_executors=3,
+
+
+        # -----------------------------------------
+        # Environment variables
+        # -----------------------------------------
+        env_vars=env_vars,
+
+
+        # -----------------------------------------
+        # Debug logs
+        # -----------------------------------------
+        verbose=True
+
+    )
+
+
+---
+
+📄 Example iplogs_spark.properties
+
+Create file:
+
+/opt/telstra/omega/config/iplogs_spark.properties
+
+Example (put your 40 configs here):
+
+spark.executor.memory=5g
+spark.executor.instances=3
+spark.executor.cores=2
+
+spark.driver.memory=4g
+spark.driver.maxResultSize=2g
+
+spark.kafka.topic.input=OMEGA-TEST-IPLOGS-REQUEST
+spark.kafka.topic.output=OMEGA-TEST-QUERY-RESPONSE
+
+spark.streaming.backpressure.enabled=true
+spark.streaming.kafka.maxRetries=10
+
+spark.executor.heartbeatInterval=60s
+spark.network.timeout=600s
+
+spark.sql.parquet.compression.codec=snappy
+
+spark.yarn.maxAppAttempts=4
+spark.yarn.submit.waitAppCompletion=false
+
+spark.debug.maxToStringFields=2147483640
+
+
+---
+
+📄 env_subscriber example
+
+Your file should contain variables like:
+
+APP_HOME=/opt/telstra/omega/internetrequestquery/current
+APP_COMMON_FILES_HOME=/opt/telstra/omega/omega-common-files
+IR_TRANSFORM=/opt/telstra/omega/internetrequestquery/current
+HB=/opt/hbase/lib
+
+SPARK_HOME=/app/spark/spark3
+HADOOP_HOME=/app/hadoop/hadoop
+HBASE_HOME=/app/hbase/hbase
+
+KAFKA_BROKER_INGEST=host1:6667,host2:6667
+ZOOKEEPER=host1:2181
+
+DATACENTRE=Deakin
+
+Airflow will automatically load them.
+
+
+---
+
+🏗 Final Architecture
+
+Airflow DAG
+     │
+     ▼
+SparkSubmitOperator
+     │
+     ▼
+spark-submit
+     │
+     ▼
+Spark properties file (40 configs)
+     │
+     ▼
+YARN cluster
+     │
+     ▼
+Kafka → Spark Streaming → HBase
+
+
+---
+
+⚠️ One Important Note
+
+Your script contains:
+
+spark.yarn.submit.waitAppCompletion=false
+
+Meaning:
+
+• Spark job runs continuously (streaming)
+• Airflow submits job and finishes task
+
+This is expected behavior.
+
+
+---
+
+⭐ Recommended Next Improvement
+
+For streaming jobs like yours, a very useful production feature is adding a pre-check task that:
+
+yarn application -list
+
+and prevents Airflow from starting duplicate streaming jobs.
+
+This is something many Spark streaming pipelines require.
+
+If you want, I can show you the exact DAG pattern used in production clusters.
