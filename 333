@@ -1,0 +1,512 @@
+Below is a clean, production-safe step-by-step guide to onboard your existing Spark job to Airflow using SparkSubmitOperator + Method 2 (auto-loading variables from env_subscriber).
+
+This keeps your environment variables centralized and avoids copying them into the DAG manually. ⚙️
+
+⸻
+
+Step 1 — Verify the env file exists on the Airflow node
+
+Your variables file must be accessible from the Airflow machine (uti01).
+
+Check:
+
+ls /opt/telstra/omega/omega-common-files/env_subscriber
+
+If it does not exist, copy it from the edge node:
+
+scp edge-node:/opt/telstra/omega/omega-common-files/env_subscriber \
+/opt/telstra/omega/omega-common-files/
+
+
+⸻
+
+Step 2 — Verify Spark client exists on Airflow node
+
+Check:
+
+which spark-submit
+
+Expected:
+
+/app/spark/spark3/bin/spark-submit
+
+If not available, export it:
+
+export SPARK_HOME=/app/spark/spark3
+export PATH=$SPARK_HOME/bin:$PATH
+
+Also make sure Hadoop configs exist:
+
+ls /app/hadoop/hadoop/etc/hadoop
+
+You should see:
+
+core-site.xml
+hdfs-site.xml
+yarn-site.xml
+
+
+⸻
+
+Step 3 — Install the Spark provider in Airflow
+
+Run as the Airflow user:
+
+pip install apache-airflow-providers-apache-spark
+
+Verify:
+
+pip show apache-airflow-providers-apache-spark
+
+
+⸻
+
+Step 4 — Create Spark connection in Airflow
+
+Open Airflow UI.
+
+Admin → Connections → Add Connection
+
+Fill:
+
+Field	Value
+Conn Id	spark_yarn
+Conn Type	Spark
+Host	yarn
+Deploy mode	cluster
+
+Save.
+
+⸻
+
+Step 5 — Create DAG file
+
+Navigate to your DAG folder.
+
+Your screenshots show:
+
+cd /app/airflow/airflow/dags
+
+Create file:
+
+nano omega_iplogs_spark_dag.py
+
+
+⸻
+
+Step 6 — Add function to load env variables
+
+Add this Python function at the top of the DAG file.
+
+def load_env_file(file_path):
+    env_vars = {}
+    with open(file_path) as f:
+        for line in f:
+            line=line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+                key,value=line.split("=",1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+This reads the env_subscriber file and converts it into a dictionary.
+
+⸻
+
+Step 7 — Load the env file
+
+Add this below the function:
+
+env_vars = load_env_file(
+    "/opt/telstra/omega/omega-common-files/env_subscriber"
+)
+
+Now all variables from your file are available.
+
+⸻
+
+Step 8 — Create the Spark DAG
+
+Add the DAG code.
+
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime
+
+with DAG(
+    dag_id="omega_iplogs_streaming",
+    start_date=datetime(2026,1,1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["spark","omega"]
+) as dag:
+
+    spark_job = SparkSubmitOperator(
+
+        task_id="run_iplogs_stream",
+
+        conn_id="spark_yarn",
+
+        application="/opt/telstra/omega/subscriber-current/irqf.jar",
+
+        java_class="com.telstra.omega.process.omegaProcessRequest",
+
+        name="omega-irqf-internetRequest-iplogs",
+
+        jars="""
+/opt/telstra/omega/internetrequestquery/current/spark-internetRequest.jar,
+/app/hbase/lib/hbase-client.jar,
+/app/cluster-essentials/*
+""",
+
+        executor_memory="5g",
+        executor_cores=2,
+        num_executors=3,
+
+        conf={
+
+            "spark.streaming.backpressure.enabled":"true",
+
+            "spark.streaming.kafka.maxRetries":"10",
+
+            "spark.executor.heartbeatInterval":"60s",
+
+            "spark.network.timeout":"600s",
+
+            "spark.sql.parquet.compression.codec":"snappy",
+
+            "spark.yarn.maxAppAttempts":"4",
+
+            "spark.yarn.submit.waitAppCompletion":"false",
+
+            "spark.debug.maxToStringFields":"2147483640"
+        },
+
+        env_vars=env_vars,
+
+        verbose=True
+    )
+
+Save the file.
+
+⸻
+
+Step 9 — Fix file permissions
+
+Ensure Airflow can read the DAG.
+
+chown airflow:airflow /app/airflow/airflow/dags/omega_iplogs_spark_dag.py
+
+
+⸻
+
+Step 10 — Restart Airflow scheduler
+
+systemctl restart airflow-scheduler
+
+Or:
+
+airflow scheduler restart
+
+
+⸻
+
+Step 11 — Verify DAG loads
+
+Check via CLI:
+
+airflow dags list
+
+You should see:
+
+omega_iplogs_streaming
+
+
+⸻
+
+Step 12 — Trigger the DAG
+
+In Airflow UI:
+
+DAGs → omega_iplogs_streaming → Trigger
+
+Or CLI:
+
+airflow dags trigger omega_iplogs_streaming
+
+
+⸻
+
+Step 13 — Verify Spark job
+
+Check YARN:
+
+yarn application -list
+
+You should see your Spark application:
+
+omega-irqf-internetRequest-iplogs
+
+
+⸻
+
+Step 14 — Verify streaming
+
+Your config contains:
+
+spark.yarn.submit.waitAppCompletion=false
+
+So Airflow will:
+	1.	submit job
+	2.	mark task success
+	3.	Spark job keeps running on YARN
+
+This is expected for streaming jobs.
+
+⸻
+
+Final Architecture
+
+Airflow (uti01)
+        │
+        │ SparkSubmitOperator
+        ▼
+spark-submit
+        │
+        ▼
+YARN ResourceManager
+        │
+        ▼
+Spark Streaming Job
+        │
+        ▼
+Kafka → Spark → HBase
+
+
+⸻
+
+✅ You now have:
+
+• Airflow orchestration
+• variables auto-loaded from env file
+• no duplication of configs
+• Spark cluster submission
+
+⸻
+
+If you want, I can also show one very useful improvement for your setup:
+
+👉 how to add a pre-check task that prevents Airflow from starting duplicate streaming jobs (a very common problem when migrating cron → Airflow).
+
+
+
+
+
+
+
+When you have ~40 Spark --conf settings, putting them directly inside the DAG (like a large Python dictionary) becomes hard to maintain, error-prone, and messy. In production Spark + Airflow environments, teams usually externalize Spark configs and keep the DAG clean.
+
+Below are the best approaches, and I’ll show what is most suitable for your job.
+
+⸻
+
+🥇 Best Option for Your Case: Use a Spark Properties File
+
+Instead of writing 40 configs inside the DAG, move them to a Spark properties file.
+
+Example file:
+
+/opt/telstra/omega/config/iplogs_spark.properties
+
+Example content:
+
+spark.executor.memory=5g
+spark.executor.instances=3
+spark.executor.cores=2
+
+spark.streaming.backpressure.enabled=true
+spark.streaming.kafka.maxRetries=10
+
+spark.executor.heartbeatInterval=60s
+spark.network.timeout=600s
+
+spark.sql.parquet.compression.codec=snappy
+
+spark.yarn.maxAppAttempts=4
+spark.yarn.submit.waitAppCompletion=false
+
+spark.debug.maxToStringFields=2147483640
+
+You can add all 40 configs here.
+
+⸻
+
+How to Use This in SparkSubmitOperator
+
+Modify the DAG:
+
+SparkSubmitOperator(
+    task_id="run_iplogs_stream",
+    conn_id="spark_yarn",
+
+    application="/opt/telstra/omega/subscriber-current/irqf.jar",
+    java_class="com.telstra.omega.process.omegaProcessRequest",
+
+    properties_file="/opt/telstra/omega/config/iplogs_spark.properties",
+
+    env_vars=env_vars,
+    verbose=True
+)
+
+Spark will automatically read the configs from that file.
+
+⸻
+
+Advantages of Using properties_file
+
+Advantage	Why it helps
+Cleaner DAG	no 40-line dictionary
+Easy tuning	change config without editing DAG
+Version control	properties file can live in Git
+Cluster portability	reuse across environments
+Debugging	easier to inspect
+
+This is the standard Spark practice.
+
+⸻
+
+Example Clean Project Layout
+
+/opt/telstra/omega/
+│
+├── config/
+│     iplogs_spark.properties
+│
+├── jars/
+│     irqf.jar
+│     spark-internetRequest.jar
+│
+├── omega-common-files/
+│     env_subscriber
+│
+└── airflow/
+      dags/
+          omega_iplogs_streaming.py
+
+Now:
+	•	DAG = orchestration
+	•	properties file = Spark tuning
+	•	env file = environment variables
+
+Clean separation.
+
+⸻
+
+🥈 Alternative Option: YAML Config
+
+Some teams store configs in YAML:
+
+spark:
+  executor_memory: 5g
+  executor_cores: 2
+  num_executors: 3
+
+conf:
+  spark.streaming.backpressure.enabled: true
+  spark.streaming.kafka.maxRetries: 10
+
+Then load in Python and pass to SparkSubmitOperator.
+
+Good, but properties file is simpler.
+
+⸻
+
+🥉 Option 3: Airflow Variables
+
+Store configs in Airflow UI.
+
+Admin → Variables
+
+But with 40 configs, this becomes messy.
+
+⸻
+
+What I Recommend for Your Job
+
+Because your job already has:
+	•	many Spark configs
+	•	Kafka configs
+	•	HBase dependencies
+	•	environment variables
+
+The best architecture is:
+
+Airflow DAG
+     │
+     ▼
+SparkSubmitOperator
+     │
+     ▼
+spark-submit
+     │
+     ▼
+properties_file (40 configs)
+     │
+     ▼
+Spark cluster
+
+This keeps the DAG very clean.
+
+⸻
+
+Example Final DAG (Clean Version)
+
+spark_job = SparkSubmitOperator(
+
+    task_id="run_iplogs_stream",
+
+    conn_id="spark_yarn",
+
+    application="/opt/telstra/omega/subscriber-current/irqf.jar",
+
+    java_class="com.telstra.omega.process.omegaProcessRequest",
+
+    properties_file="/opt/telstra/omega/config/iplogs_spark.properties",
+
+    env_vars=env_vars,
+
+    verbose=True
+)
+
+The DAG becomes 10 lines instead of 80 lines.
+
+⸻
+
+Small Extra Tip
+
+You can even store the properties file in HDFS:
+
+hdfs:///apps/omega/config/iplogs.properties
+
+Then Spark nodes automatically access it.
+
+⸻
+
+✅ Recommendation for your case:
+
+Use:
+
+1️⃣ env_subscriber → environment variables
+2️⃣ iplogs_spark.properties → all Spark configs
+3️⃣ Airflow DAG → orchestration only
+
+This is the cleanest production pattern.
+
+⸻
+
+If you want, I can also show a very useful trick:
+how to automatically extract all 40 --conf lines from your existing shell script and generate the iplogs_spark.properties file in one command (saves a lot of manual work).
