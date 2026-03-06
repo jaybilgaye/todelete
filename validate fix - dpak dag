@@ -1,0 +1,274 @@
+Great — now that the validation DAG works, we can build the actual Spark DAG using the same env loader fix (handling export).
+
+This DAG will:
+
+load env_subscriber
+
+strip export
+
+pass variables to SparkSubmitOperator
+
+use your properties file
+
+run the same Spark job your shell script runs
+
+
+
+---
+
+📄 Spark DAG File
+
+Create:
+
+/app/airflow/airflow/dags/omega_iplogs_spark_dag.py
+
+
+---
+
+Complete DAG
+
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime
+
+
+# ------------------------------------------------
+# Load env file (handles "export VAR=value")
+# ------------------------------------------------
+def load_env_file(file_path):
+
+    env_vars = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            # remove export keyword
+            if line.startswith("export"):
+                line = line.replace("export ", "", 1)
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+
+# ------------------------------------------------
+# Load env variables
+# ------------------------------------------------
+env_vars = load_env_file(
+    "/opt/telstra/omega/omega-common-files/env_subscriber"
+)
+
+
+# ------------------------------------------------
+# DAG Definition
+# ------------------------------------------------
+with DAG(
+
+    dag_id="omega_iplogs_streaming",
+
+    start_date=datetime(2026, 1, 1),
+
+    schedule=None,
+
+    catchup=False,
+
+    tags=["spark", "omega", "iplogs"]
+
+) as dag:
+
+
+    run_spark_job = SparkSubmitOperator(
+
+        task_id="submit_omega_iplogs",
+
+        conn_id="spark_yarn",
+
+        # --------------------------------
+        # Spark Application
+        # --------------------------------
+        application="/opt/telstra/omega/internetrequestquery/current/irqf.jar",
+
+        java_class="com.telstra.omega.process.omegaProcessRequest",
+
+        name="omega-IRqF-internetRequest-iplogs",
+
+        # --------------------------------
+        # Spark master
+        # --------------------------------
+        master="yarn",
+
+        deploy_mode="cluster",
+
+        # --------------------------------
+        # Spark configs
+        # --------------------------------
+        properties_file="/opt/telstra/omega/config/iplogs_spark.properties",
+
+        # --------------------------------
+        # Files copied to executors
+        # --------------------------------
+        files="""
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-executor.properties,
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-driver.properties,
+/opt/hbase/conf/hbase-site.xml
+""",
+
+        # --------------------------------
+        # Additional jars
+        # --------------------------------
+        jars="""
+/opt/telstra/omega/internetrequestquery/current/spark-internetRequest.jar,
+/app/hbase/lib/hbase-client.jar,
+/app/cluster-essentials/*
+""",
+
+        # --------------------------------
+        # Resources
+        # --------------------------------
+        executor_memory="5g",
+
+        executor_cores=2,
+
+        num_executors=3,
+
+        # --------------------------------
+        # Environment variables
+        # --------------------------------
+        env_vars=env_vars,
+
+        # --------------------------------
+        # Logging
+        # --------------------------------
+        verbose=True
+
+    )
+
+
+---
+
+How This DAG Maps to Your Shell Script
+
+Your script had:
+
+$SPARK_HOME/bin/spark-submit \
+--master yarn
+--deploy-mode cluster
+--files ...
+--conf ...
+--class com.telstra.omega.process.omegaProcessRequest
+irqf.jar
+
+The DAG maps exactly to:
+
+Shell Script	Airflow
+
+spark-submit	SparkSubmitOperator
+--master yarn	master="yarn"
+--deploy-mode cluster	deploy_mode="cluster"
+--class	java_class
+--files	files
+--jars	jars
+--conf	properties_file
+env vars	env_vars
+
+
+
+---
+
+Deployment Steps
+
+1️⃣ Save DAG
+
+/app/airflow/airflow/dags/omega_iplogs_spark_dag.py
+
+
+---
+
+2️⃣ Restart scheduler (optional)
+
+systemctl restart airflow-scheduler
+
+or wait ~30 sec.
+
+
+---
+
+3️⃣ In Airflow UI
+
+DAGs → omega_iplogs_streaming
+
+Trigger manually.
+
+
+---
+
+What Will Happen
+
+Airflow Scheduler
+        │
+        ▼
+SparkSubmitOperator
+        │
+        ▼
+spark-submit
+        │
+        ▼
+YARN cluster
+        │
+        ▼
+Spark Streaming job starts
+
+
+---
+
+Expected Behavior (Important)
+
+Your Spark config contains:
+
+spark.yarn.submit.waitAppCompletion=false
+
+Meaning:
+
+Airflow submits the streaming job
+
+Airflow task finishes immediately
+
+job continues running in YARN
+
+
+This is normal for streaming jobs.
+
+
+---
+
+Next Improvement (Highly Recommended)
+
+Before running this DAG in production, we should add a duplicate job protection check like your shell script had:
+
+check-active-job.sh $APP_NAME
+
+Otherwise Airflow might start multiple streaming jobs.
+
+A small YARN check task solves this.
+
+
+---
+
+If you want, I can also show you a very powerful Airflow pattern used in large Spark clusters:
+
+👉 Self-healing Spark streaming DAG
+Airflow automatically:
+
+checks if job is running
+
+restarts it if YARN killed it
+
+prevents duplicates.
