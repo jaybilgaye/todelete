@@ -1,0 +1,21 @@
+def load_env_file(file_path):
+
+    env_vars = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("export"):
+                line = line.replace("export ", "", 1)
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
