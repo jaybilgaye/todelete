@@ -1,0 +1,248 @@
+That’s a very good idea 👍 — in production we often create a “validation DAG” before the real Spark DAG to ensure:
+
+env variables from env_subscriber are loaded correctly
+
+Spark properties_file values are readable
+
+paths like APP_COMMON_FILES_HOME, APP_HOME, etc. are resolved
+
+no missing configs before submitting Spark
+
+
+This avoids debugging failures after Spark starts.
+
+Below is a safe validation DAG that:
+
+1️⃣ loads the env file
+2️⃣ reads the Spark properties file
+3️⃣ prints everything in Airflow logs
+4️⃣ fails if anything is missing
+
+
+---
+
+📄 Validation DAG File
+
+Create file:
+
+/app/airflow/airflow/dags/omega_iplogs_config_validation_dag.py
+
+
+---
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+
+ENV_FILE = "/opt/telstra/omega/omega-common-files/env_subscriber"
+
+PROPERTIES_FILE = "/opt/telstra/omega/config/iplogs_spark.properties"
+
+
+# ---------------------------------------------------
+# Load env variables
+# ---------------------------------------------------
+def load_env_file(file_path):
+
+    env_vars = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+
+# ---------------------------------------------------
+# Load spark properties
+# ---------------------------------------------------
+def load_properties(file_path):
+
+    props = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                props[key.strip()] = value.strip()
+
+    return props
+
+
+# ---------------------------------------------------
+# Validation function
+# ---------------------------------------------------
+def validate_config():
+
+    print("\n===== Loading Environment Variables =====")
+
+    env_vars = load_env_file(ENV_FILE)
+
+    for k, v in env_vars.items():
+        print(f"{k} = {v}")
+
+
+    print("\n===== Loading Spark Properties =====")
+
+    props = load_properties(PROPERTIES_FILE)
+
+    for k, v in props.items():
+        print(f"{k} = {v}")
+
+
+    print("\n===== Basic Validation =====")
+
+
+    required_env = [
+        "APP_HOME",
+        "APP_COMMON_FILES_HOME",
+        "SPARK_HOME",
+        "HADOOP_HOME",
+        "HBASE_HOME"
+    ]
+
+
+    for var in required_env:
+
+        if var not in env_vars:
+            raise Exception(f"Missing ENV variable: {var}")
+
+        print(f"{var} OK")
+
+
+    required_props = [
+        "spark.executor.memory",
+        "spark.executor.instances",
+        "spark.executor.cores"
+    ]
+
+
+    for p in required_props:
+
+        if p not in props:
+            raise Exception(f"Missing Spark property: {p}")
+
+        print(f"{p} OK")
+
+
+    print("\n✅ Environment + Spark properties validation successful")
+
+
+# ---------------------------------------------------
+# DAG definition
+# ---------------------------------------------------
+with DAG(
+
+    dag_id="omega_iplogs_config_validation",
+
+    start_date=datetime(2026, 1, 1),
+
+    schedule_interval=None,
+
+    catchup=False,
+
+    tags=["spark", "validation", "omega"]
+
+) as dag:
+
+
+    validate_environment = PythonOperator(
+
+        task_id="validate_env_and_properties",
+
+        python_callable=validate_config
+
+    )
+
+
+---
+
+What This DAG Does
+
+When you run it, the Airflow logs will show:
+
+===== Loading Environment Variables =====
+APP_HOME=/opt/telstra/omega/internetrequestquery/current
+APP_COMMON_FILES_HOME=/opt/telstra/omega/omega-common-files
+SPARK_HOME=/app/spark/spark3
+...
+
+===== Loading Spark Properties =====
+spark.executor.memory=5g
+spark.executor.instances=3
+spark.executor.cores=2
+...
+
+===== Basic Validation =====
+APP_HOME OK
+APP_COMMON_FILES_HOME OK
+spark.executor.memory OK
+spark.executor.instances OK
+
+Environment + Spark properties validation successful
+
+If something is wrong, the DAG fails immediately.
+
+
+---
+
+How to Run It
+
+Restart scheduler:
+
+systemctl restart airflow-scheduler
+
+Then in UI:
+
+DAGs → omega_iplogs_config_validation → Trigger
+
+
+---
+
+Recommended Workflow
+
+Run this order:
+
+1️⃣ omega_iplogs_config_validation
+2️⃣ omega_iplogs_streaming
+
+So configuration is verified first.
+
+
+---
+
+⭐ Pro Tip (Used in Production)
+
+You can also extend this DAG to check:
+
+spark-submit availability
+Kafka broker connectivity
+HDFS access
+YARN access
+Jar file existence
+
+This becomes a Spark pipeline health check DAG.
+
+
+---
+
+If you'd like, I can also show you a very powerful Airflow pattern used in production:
+
+👉 a single DAG that automatically generates SparkSubmitOperator tasks from your properties file and env file (so you never hardcode anything in the DAG).
