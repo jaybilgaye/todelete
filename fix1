@@ -1,0 +1,291 @@
+Good — we will now implement Option 1 (Python resolves ${VAR} in the Spark properties file).
+This means your DAG will:
+
+1. Load env_subscriber
+
+
+2. Load iplogs_spark.properties
+
+
+3. Replace variables like ${DATACENTRE} with values from the env file
+
+
+4. Pass them to Spark using conf=... instead of properties_file
+
+
+
+So Spark receives fully resolved configs.
+
+
+---
+
+What changes from your previous DAG
+
+You need to change 3 things only:
+
+1️⃣ Add a function to load and resolve properties
+
+Add this below the load_env_file() function.
+
+def load_properties(file_path, env_vars):
+
+    props = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+
+                key, value = line.split("=", 1)
+
+                # resolve ${VAR}
+                for k, v in env_vars.items():
+                    value = value.replace("${"+k+"}", v)
+
+                props[key.strip()] = value.strip()
+
+    return props
+
+
+---
+
+2️⃣ Load the properties file
+
+Add this after loading env variables.
+
+spark_conf = load_properties(
+    "/opt/telstra/omega/config/iplogs_spark.properties",
+    env_vars
+)
+
+
+---
+
+3️⃣ Replace properties_file with conf
+
+Before:
+
+properties_file="/opt/telstra/omega/config/iplogs_spark.properties"
+
+Remove that line.
+
+Add:
+
+conf=spark_conf
+
+
+---
+
+Final Updated DAG (only relevant parts)
+
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import subprocess
+
+
+def load_env_file(file_path):
+
+    env_vars = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("export"):
+                line = line.replace("export ", "", 1)
+
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_vars[key.strip()] = value.strip()
+
+    return env_vars
+
+
+def load_properties(file_path, env_vars):
+
+    props = {}
+
+    with open(file_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "=" in line:
+
+                key, value = line.split("=", 1)
+
+                for k, v in env_vars.items():
+                    value = value.replace("${"+k+"}", v)
+
+                props[key.strip()] = value.strip()
+
+    return props
+
+
+env_vars = load_env_file(
+    "/opt/telstra/omega/omega-common-files/env_subscriber"
+)
+
+
+spark_conf = load_properties(
+    "/opt/telstra/omega/config/iplogs_spark.properties",
+    env_vars
+)
+
+
+def check_if_running():
+
+    app_name = "omega-IRqF-internetRequest-iplogs"
+
+    cmd = "yarn application -list -appStates RUNNING"
+
+    result = subprocess.check_output(cmd, shell=True).decode()
+
+    if app_name in result:
+        raise Exception(f"Spark job already running: {app_name}")
+
+
+
+with DAG(
+
+    dag_id="omega_iplogs_streaming",
+
+    start_date=datetime(2026,1,1),
+
+    schedule=None,
+
+    catchup=False,
+
+    tags=["spark","omega"]
+
+) as dag:
+
+
+    check_running = PythonOperator(
+
+        task_id="check_if_spark_running",
+
+        python_callable=check_if_running
+
+    )
+
+
+    run_spark_job = SparkSubmitOperator(
+
+        task_id="submit_omega_iplogs",
+
+        conn_id="spark_yarn",
+
+        application="/opt/telstra/omega/internetrequestquery/current/irqf.jar",
+
+        java_class="com.telstra.omega.process.omegaProcessRequest",
+
+        name="omega-IRqF-internetRequest-iplogs",
+
+        master="yarn",
+
+        deploy_mode="cluster",
+
+        conf=spark_conf,
+
+        files="""
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-executor.properties,
+/opt/telstra/omega/omega-common-files/log4j-irqf/irqf-IPLOGS-log4j-driver.properties,
+/opt/hbase/conf/hbase-site.xml
+""",
+
+        jars="""
+/opt/telstra/omega/internetrequestquery/current/spark-internetRequest.jar,
+/app/hbase/lib/hbase-client.jar,
+/app/cluster-essentials/*
+""",
+
+        executor_memory="5g",
+
+        executor_cores=2,
+
+        num_executors=3,
+
+        env_vars=env_vars,
+
+        verbose=True
+
+    )
+
+
+    check_running >> run_spark_job
+
+
+---
+
+Now your configs will work like this
+
+Example iplogs_spark.properties:
+
+spark.kafka.topic.input=OMEGA-${DATACENTRE}-IPLOGS-REQUEST
+
+Example env file:
+
+DATACENTRE=DEAKIN
+
+Before submitting Spark, Python converts it to:
+
+spark.kafka.topic.input=OMEGA-DEAKIN-IPLOGS-REQUEST
+
+Spark receives the resolved config.
+
+
+---
+
+Final architecture
+
+env_subscriber
+      │
+      ▼
+Airflow loads env
+      │
+      ▼
+properties loader resolves ${VAR}
+      │
+      ▼
+SparkSubmitOperator(conf=resolved)
+      │
+      ▼
+spark-submit → YARN
+
+
+---
+
+Recommended small improvement (very useful)
+
+Add a debug line before Spark submit:
+
+print("Resolved Spark Config:", spark_conf)
+
+This prints the final Spark configuration in Airflow logs.
+
+It helps debugging a lot.
+
+
+---
+
+If you want, I can also show you a very powerful improvement used in production Spark + Airflow pipelines:
+
+Automatically generate the Spark DAG from your existing shell script so onboarding future jobs takes 30 seconds instead of hours.
