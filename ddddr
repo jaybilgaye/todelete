@@ -1,0 +1,220 @@
+Excellent approach 👍
+This is exactly how platform engineers debug Spark + Airflow deployments: validate each layer before running the real job.
+
+We will build a very small validation DAG that checks:
+
+1️⃣ Spark installation
+2️⃣ Hadoop classpath
+3️⃣ YARN connectivity
+4️⃣ HDFS connectivity
+5️⃣ Ability to submit a Spark job to YARN
+
+We will start with command-line checks, then create the DAG.
+
+
+---
+
+Step 1 — Validate environment from command line (Airflow node)
+
+Run these commands on the Airflow server.
+
+1️⃣ Verify Spark
+
+/app/spark/spark3/bin/spark-submit --version
+
+Expected:
+
+Spark 3.4.1
+Scala 2.12
+
+You already confirmed this.
+
+
+---
+
+2️⃣ Verify Hadoop installation
+
+ls -l /opt/hadoop
+
+Expected:
+
+/opt/hadoop -> /app/hadoop/hadoop-3.4.1
+
+Good in your environment.
+
+
+---
+
+3️⃣ Verify Hadoop classpath
+
+Run:
+
+/opt/hadoop/bin/hadoop classpath
+
+Expected output should contain:
+
+/app/hadoop/hadoop/share/hadoop/common
+/app/hadoop/hadoop/share/hadoop/yarn
+/app/hadoop/hadoop/share/hadoop/hdfs
+
+If this command fails → Hadoop is not usable from the Airflow node.
+
+
+---
+
+4️⃣ Verify HDFS connectivity
+
+Run:
+
+/opt/hadoop/bin/hdfs dfs -ls /
+
+Expected:
+
+Found X items
+drwxr-xr-x   - hdfs ...
+
+If this fails → Hadoop config is wrong.
+
+
+---
+
+5️⃣ Verify YARN connectivity
+
+Run:
+
+/opt/hadoop/bin/yarn node -list
+
+Expected:
+
+Total Nodes: X
+
+If this fails → YARN config not loaded.
+
+
+---
+
+6️⃣ Verify Spark → YARN submission
+
+Run:
+
+SPARK_DIST_CLASSPATH=$(/opt/hadoop/bin/hadoop classpath) \
+/app/spark/spark3/bin/spark-submit \
+--master yarn \
+--deploy-mode cluster \
+--class org.apache.spark.examples.SparkPi \
+/app/spark/spark3/examples/jars/spark-examples*.jar 10
+
+Expected:
+
+Submitted application application_XXXXX
+
+If this works → your cluster integration is correct.
+
+
+---
+
+Step 2 — Create a validation DAG
+
+Now we automate these checks in Airflow.
+
+Create DAG:
+
+spark_cluster_validation_dag.py
+
+Validation DAG
+
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from datetime import datetime
+
+SPARK_HOME = "/app/spark/spark3"
+HADOOP_HOME = "/opt/hadoop"
+
+with DAG(
+    dag_id="spark_cluster_validation",
+    start_date=datetime(2026,1,1),
+    schedule=None,
+    catchup=False,
+    tags=["spark","validation"]
+) as dag:
+
+    check_spark = BashOperator(
+        task_id="check_spark_version",
+        bash_command=f"{SPARK_HOME}/bin/spark-submit --version"
+    )
+
+    check_hadoop = BashOperator(
+        task_id="check_hadoop_classpath",
+        bash_command=f"{HADOOP_HOME}/bin/hadoop classpath"
+    )
+
+    check_hdfs = BashOperator(
+        task_id="check_hdfs_access",
+        bash_command=f"{HADOOP_HOME}/bin/hdfs dfs -ls /"
+    )
+
+    check_yarn = BashOperator(
+        task_id="check_yarn_nodes",
+        bash_command=f"{HADOOP_HOME}/bin/yarn node -list"
+    )
+
+    spark_test = BashOperator(
+        task_id="spark_pi_test",
+        bash_command=f"""
+        export SPARK_DIST_CLASSPATH=$({HADOOP_HOME}/bin/hadoop classpath)
+
+        {SPARK_HOME}/bin/spark-submit \
+        --master yarn \
+        --deploy-mode cluster \
+        --class org.apache.spark.examples.SparkPi \
+        {SPARK_HOME}/examples/jars/spark-examples*.jar 10
+        """
+    )
+
+    check_spark >> check_hadoop >> check_hdfs >> check_yarn >> spark_test
+
+
+---
+
+What this DAG validates
+
+Task	What it proves
+
+spark version	Spark installed
+hadoop classpath	Hadoop jars visible
+hdfs access	NameNode reachable
+yarn nodes	ResourceManager reachable
+spark_pi_test	Spark → YARN submission works
+
+
+
+---
+
+Expected final result
+
+In Airflow UI you should see:
+
+check_spark_version      ✓
+check_hadoop_classpath   ✓
+check_hdfs_access        ✓
+check_yarn_nodes         ✓
+spark_pi_test            ✓
+
+If spark_pi_test succeeds, your main DAG will work.
+
+
+---
+
+Next step after validation
+
+Once this passes, we will:
+
+1️⃣ Build correct SparkSubmitOperator config
+2️⃣ Load env + properties cleanly
+3️⃣ Remove all hardcoded classpaths
+4️⃣ Convert your production job DAG
+
+
+---
+
+If you'd like, I can also show you a much better production DAG pattern used by large Spark platforms (Netflix, Uber style) that makes Spark + Airflow integration far simpler and safer.
