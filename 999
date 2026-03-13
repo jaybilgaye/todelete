@@ -1,0 +1,254 @@
+"""
+Airflow DAG: Omega Internet Request Query - IP Logs Spark Job
+=============================================================
+Migrated from edge node (ost-clc-rom-mas-edg-c01) to UTI node (Airflow).
+
+Uses SparkSubmitOperator with all config externalized to:
+    /opt/telstra/omega/omega-common-files/airflow/omega_iplogs_config.json
+
+Original script: submit_internetRequestQuery-ipLogs.sh
+Main class: com.telstra.omega.process.omegaProcessRequest
+Flow: Kafka (OMEGA-TEST-IPLOGS-REQUEST) -> Spark Streaming -> HBase
+"""
+
+import json
+import os
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+
+# ---------------------------------------------------------------------------
+# Load external config
+# ---------------------------------------------------------------------------
+CONFIG_PATH = os.environ.get(
+    "OMEGA_IPLOGS_CONFIG",
+    "/opt/telstra/omega/omega-common-files/airflow/omega_iplogs_config.json",
+)
+
+with open(CONFIG_PATH, "r") as f:
+    cfg = json.load(f)
+
+paths = cfg["paths"]
+kafka = cfg["kafka"]
+hbase = cfg["hbase"]
+env = cfg["environment"]
+res = cfg["spark_resources"]
+app = cfg["app"]
+files_cfg = cfg["files"]
+jars_cfg = cfg["jars"]
+spark_conf = cfg["spark_conf"]
+
+# ---------------------------------------------------------------------------
+# Common environment variables for all tasks
+# Ensures Hadoop/Spark/HBase clients find their configs correctly
+# ---------------------------------------------------------------------------
+TASK_ENV = {
+    "SPARK_HOME": paths["spark_home"],
+    "HADOOP_HOME": paths["hadoop_home"],
+    "HBASE_HOME": paths["hbase_home"],
+    "HADOOP_CONF_DIR": paths.get("hadoop_conf_dir", f"{paths['hadoop_home']}/etc/hadoop"),
+    "HADOOP_COMMON_LIB_NATIVE_DIR": f"{paths['hadoop_home']}/lib/native",
+    "JAVA_HOME": paths.get("java_home", "/usr/lib/jvm/java"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Helper: resolve ${var} placeholders in jar/file paths
+# ---------------------------------------------------------------------------
+def resolve_path(path_str: str) -> str:
+    """Replace ${key} tokens with values from the paths config."""
+    replacements = {
+        "${ir_transform}": paths["ir_transform"],
+        "${app_home}": paths["app_home"],
+        "${app_common_files_home}": paths["app_common_files_home"],
+        "${hb_lib}": paths["hb_lib"],
+        "${ce_lib}": paths["ce_lib"],
+    }
+    for token, value in replacements.items():
+        path_str = path_str.replace(token, value)
+    return path_str
+
+
+def resolve_jar_list(jar_list: list) -> list:
+    return [resolve_path(j) for j in jar_list]
+
+
+# ---------------------------------------------------------------------------
+# Build jar and file lists
+# ---------------------------------------------------------------------------
+application_jar = resolve_path(jars_cfg["application_jar"])
+
+extra_jars = (
+    resolve_jar_list(jars_cfg["hbase_jars"])
+    + resolve_jar_list(jars_cfg["ce_jars"])
+    + [resolve_path(jars_cfg["irqf_jar"])]
+)
+
+distributed_files = ",".join([
+    resolve_path(files_cfg["log4j_executor"]),
+    resolve_path(files_cfg["log4j_driver"]),
+    paths["hbase_conf"],
+])
+
+
+# ---------------------------------------------------------------------------
+# Build spark conf dict (partition-dependent confs use DAG param)
+# ---------------------------------------------------------------------------
+def build_spark_conf(partition: str) -> dict:
+    """Merge static spark confs with partition-dependent dynamic confs."""
+    conf = dict(spark_conf)  # copy static confs
+
+    # Kafka confs
+    conf["spark.kafka.broker.ingest"] = kafka["broker_ingest"]
+    conf["spark.kafka.zookeeper.ingest"] = kafka["zookeeper"]
+    conf["spark.kafka.broker.egest"] = kafka["broker_egest"]
+    conf["spark.kafka.topic.input"] = kafka["topic_input"]
+    conf["spark.kafka.topic.output"] = kafka["topic_output"]
+    conf["spark.kafka.input.interval"] = kafka["input_interval"]
+    conf["spark.kafka.group"] = kafka["group"]
+    conf["spark.kafka.security.protocol.ingress"] = kafka["security_protocol_ingress"]
+    conf["spark.kafka.security.protocol.egress"] = kafka["security_protocol_egress"]
+
+    # HBase
+    conf["hbase.zookeeper.quorum"] = hbase["zookeeper_quorum"]
+
+    # Environment
+    conf["spark.omega.query.environment"] = env["datacentre"]
+
+    # Log4j
+    conf["spark.executor.extraJavaOptions"] = (
+        "-Dlog4j2.configurationFile=irqf-IPLOGS-log4j-executor.properties"
+    )
+    conf["spark.driver.extraJavaOptions"] = (
+        "-Dlog4j2.configurationFile=irqf-IPLOGS-log4j-driver.properties"
+    )
+
+    # Partition-dependent confs
+    conf["spark.omega.irqf.checkpoint"] = f"/OMEGA/checkpoint/iplookup/{partition}"
+    conf["spark.kafka.which.partition.toPoll"] = partition
+    conf["spark.omega.checkpointDir"] = f"/OMEGA/CHECKPOINT/IPLOGS-TEST/{partition}"
+
+    # Dynamic executor failures based on num_executors
+    num_exec = int(res["num_executors"])
+    conf["spark.yarn.max.executor.failures"] = str(8 * num_exec)
+
+    return conf
+
+
+# ---------------------------------------------------------------------------
+# Default args
+# ---------------------------------------------------------------------------
+default_args = {
+    "owner": "omega",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
+with DAG(
+    dag_id="omega_iplogs_spark_job",
+    default_args=default_args,
+    description="Spark Streaming: Kafka -> HBase (Internet Request Query IP Logs)",
+    start_date=datetime(2026, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["omega", "spark", "kafka", "hbase", "iplogs"],
+    params={"partition": app["default_partition"]},
+) as dag:
+
+    # -----------------------------------------------------------------------
+    # Task 1: Pre-flight validation
+    # -----------------------------------------------------------------------
+    preflight = BashOperator(
+        task_id="preflight_checks",
+        env=TASK_ENV,
+        append_env=True,
+        bash_command=f"""
+        set -e
+        echo "=== Pre-flight Checks ==="
+        echo "HADOOP_CONF_DIR=$HADOOP_CONF_DIR"
+
+        # Verify spark-submit
+        test -x {paths['spark_home']}/bin/spark-submit \
+            && echo "OK: spark-submit" \
+            || {{ echo "FAIL: spark-submit not found"; exit 1; }}
+
+        # Verify application jar
+        test -f {resolve_path(jars_cfg['application_jar'])} \
+            && echo "OK: application jar" \
+            || {{ echo "FAIL: application jar missing"; exit 1; }}
+
+        # Verify irqf jar
+        test -f {resolve_path(jars_cfg['irqf_jar'])} \
+            && echo "OK: irqf jar" \
+            || {{ echo "FAIL: irqf jar missing"; exit 1; }}
+
+        # Verify hbase-site.xml
+        test -f {paths['hbase_conf']} \
+            && echo "OK: hbase-site.xml" \
+            || {{ echo "FAIL: hbase-site.xml missing"; exit 1; }}
+
+        # Verify YARN is reachable
+        {paths['hadoop_home']}/bin/yarn node -list -states RUNNING 2>/dev/null | head -5 \
+            && echo "OK: YARN" \
+            || {{ echo "FAIL: YARN unreachable"; exit 1; }}
+
+        # Verify HDFS checkpoint dirs
+        {paths['hadoop_home']}/bin/hdfs dfs -test -d /OMEGA/checkpoint \
+            || echo "WARN: /OMEGA/checkpoint dir not found in HDFS"
+
+        echo "=== All pre-flight checks passed ==="
+        """,
+    )
+
+    # -----------------------------------------------------------------------
+    # Task 2: Spark Submit - the actual job
+    # -----------------------------------------------------------------------
+    submit_iplogs_job = SparkSubmitOperator(
+        task_id="submit_iplogs_spark_job",
+        conn_id="spark_default",
+        application=application_jar,
+        java_class=app["main_class"],
+        name=f"{app['name_prefix']}-{{{{ params.partition }}}}",
+        conf=build_spark_conf(app["default_partition"]),
+        jars=",".join(extra_jars),
+        files=distributed_files,
+        num_executors=int(res["num_executors"]),
+        executor_cores=int(res["executor_cores"]),
+        executor_memory=res["executor_memory"],
+        driver_memory=res["driver_memory"],
+        env_vars=TASK_ENV,
+        verbose=True,
+        # NOTE: spark_default connection already sets:
+        #   master=yarn, deploy-mode=cluster,
+        #   spark_binary=/app/spark/spark3/bin/spark-submit,
+        #   yarn_queue=query
+    )
+
+    # -----------------------------------------------------------------------
+    # Task 3: Post-submit validation
+    # -----------------------------------------------------------------------
+    post_check = BashOperator(
+        task_id="post_submit_check",
+        env=TASK_ENV,
+        append_env=True,
+        bash_command=f"""
+        echo "=== Post-Submit Check ==="
+        echo "Spark job submitted in cluster mode (waitAppCompletion=false)"
+        echo "Monitor via YARN:"
+        echo "  {paths['hadoop_home']}/bin/yarn application -list | grep {app['name_prefix']}"
+        echo "=== Done ==="
+        """,
+    )
+
+    # -----------------------------------------------------------------------
+    # Pipeline
+    # -----------------------------------------------------------------------
+    preflight >> submit_iplogs_job >> post_check
