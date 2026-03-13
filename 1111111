@@ -1,0 +1,100 @@
+{
+    "app": {
+        "name_prefix": "omega-IRQF-internetRequest-ipLogs",
+        "main_class": "com.telstra.omega.process.omegaProcessRequest",
+        "default_partition": "0"
+    },
+
+    "paths": {
+        "app_home": "/opt/telstra/omega/internetrequestquery/current",
+        "app_common_files_home": "/opt/telstra/omega/omega-common-files",
+        "ir_transform": "/opt/telstra/omega/internetrequest/current",
+        "spark_home": "/app/spark/spark3",
+        "hadoop_home": "/app/hadoop/hadoop",
+        "hbase_home": "/app/hbase/hbase",
+        "hbase_conf": "/opt/hbase/conf/hbase-site.xml",
+        "hb_lib": "/opt/hbase/lib",
+        "ce_lib": "/app/cluster-essentials"
+    },
+
+    "jars": {
+        "application_jar": "${ir_transform}/spark-internetRequest.jar",
+        "irqf_jar": "${app_home}/irqf.jar",
+        "hbase_jars": [
+            "${hb_lib}/hbase-common.jar",
+            "${hb_lib}/hbase-client.jar",
+            "${hb_lib}/shaded-clients/hbase-shaded-mapreduce.jar",
+            "${hb_lib}/hbase-shaded-protobuf.jar"
+        ],
+        "ce_jars": [
+            "${ce_lib}/hbase-spark.jar",
+            "${ce_lib}/hbase-spark-protocol-shaded.jar",
+            "${ce_lib}/scala-library-2.12.12.jar",
+            "${ce_lib}/scala-parser-combinators_2.12-1.1.2.jar"
+        ]
+    },
+
+    "files": {
+        "log4j_executor": "${app_common_files_home}/log4j-irqf/irqf-IPLOGS-log4j-executor.properties",
+        "log4j_driver": "${app_common_files_home}/log4j-irqf/irqf-IPLOGS-log4j-driver.properties"
+    },
+
+    "kafka": {
+        "broker_ingest": "ost-clc-rom-kaf-c01.linux.ostravam.corp.telstra.com:6667,ost-clc-rom-kaf-c02.linux.ostravam.corp.telstra.com:6667,ost-clc-rom-kaf-c03.linux.ostravam.corp.telstra.com:6667",
+        "broker_egest": "ost-clc-rom-kaf-c01.linux.ostravam.corp.telstra.com:6667,ost-clc-rom-kaf-c02.linux.ostravam.corp.telstra.com:6667,ost-clc-rom-kaf-c03.linux.ostravam.corp.telstra.com:6667",
+        "zookeeper": "ost-clc-rom-kaf-c01.linux.ostravam.corp.telstra.com:2181,ost-clc-rom-kaf-c02.linux.ostravam.corp.telstra.com:2181,ost-clc-rom-kaf-c03.linux.ostravam.corp.telstra.com:2181",
+        "topic_input": "OMEGA-TEST-IPLOGS-REQUEST",
+        "topic_output": "OMEGA-TEST-QUERY-RESPONSE",
+        "group": "omega-irqf-iplogs.test.2",
+        "input_interval": "1",
+        "security_protocol_ingress": "PLAINTEXT",
+        "security_protocol_egress": "PLAINTEXT"
+    },
+
+    "hbase": {
+        "zookeeper_quorum": "ost-clc-rom-mas-zoo-c01.linux.ostravam.corp.telstra.com,ost-clc-rom-mas-zoo-c02.linux.ostravam.corp.telstra.com,ost-clc-rom-mas-zoo-c03.linux.ostravam.corp.telstra.com"
+    },
+
+    "environment": {
+        "datacentre": "Deakin",
+        "env": "TEST"
+    },
+
+    "spark_resources": {
+        "num_executors": "3",
+        "executor_memory": "5g",
+        "executor_cores": "2",
+        "driver_memory": "4g"
+    },
+
+    "spark_conf": {
+        "spark.ui.port": "18086",
+        "spark.driver.maxResultSize": "2g",
+        "spark.streaming.kafka.maxRetries": "10",
+        "spark.fetch.message.max.bytes": "36700160",
+        "spark.hive.enable.stats": "true",
+        "spark.executor.heartbeatInterval": "60s",
+        "spark.network.timeout": "600s",
+        "spark.streaming.backpressure.enabled": "true",
+        "spark.streaming.kafka.maxRatePerPartition": "1",
+        "spark.streaming.receiver.maxRate": "10",
+        "spark.enable.kafka.output": "true",
+        "spark.omega.query.dateField": "recordOpeningTime",
+        "spark.omega.security": "true",
+        "spark.sql.parquet.binaryAsString": "true",
+        "spark.sql.legacy.timeParserPolicy": "LEGACY",
+        "spark.enable.partition": "true",
+        "spark.omega.fetch.limit": "500",
+        "spark.sql.codegen.wholeStage": "false",
+        "spark.omega.fetch.disable": "false",
+        "spark.yarn.scheduler.heartbeat.interval-ms": "1000",
+        "spark.sql.parquet.compression.codec": "snappy",
+        "spark.scheduler.minRegisteredResourcesRatio": "1",
+        "spark.yarn.maxAppAttempts": "4",
+        "spark.yarn.am.attemptFailuresValidityInterval": "1h",
+        "spark.yarn.executor.failuresValidityInterval": "1h",
+        "spark.task.maxFailures": "8",
+        "spark.yarn.submit.waitAppCompletion": "false",
+        "spark.debug.maxToStringFields": "2147483640"
+    }
+}
