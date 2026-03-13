@@ -1,0 +1,266 @@
+Perfect 👍 — this is exactly the right engineering approach.
+Now that Spark → YARN → HDFS works, the next step is to validate the environment exactly like your streaming job expects, but without running the real job yet.
+
+We will build progressive validation DAGs that mimic your streaming job.
+
+Goal now:
+
+Validate that these are correct before running the real job:
+
+1️⃣ env_subscriber file loading
+2️⃣ variable substitution in iplogs_spark.properties
+3️⃣ Spark configs passed correctly
+4️⃣ extra classpaths (HBase / Hadoop)
+5️⃣ files passed to Spark
+6️⃣ jar loading
+7️⃣ java class loading
+
+We will validate each stage step-by-step.
+
+
+---
+
+Step 1 — Validate ENV file loading
+
+First check that your Airflow DAG correctly reads:
+
+/opt/telstra/omega/omega-common-files/env_subscriber
+
+Create a DAG task to print env vars.
+
+DAG snippet
+
+from airflow.operators.python import PythonOperator
+
+def validate_env():
+    env_vars = load_env_file("/opt/telstra/omega/omega-common-files/env_subscriber")
+
+    print("Loaded ENV variables:")
+    for k,v in env_vars.items():
+        print(f"{k}={v}")
+
+Task:
+
+validate_env_task = PythonOperator(
+    task_id="validate_env_file",
+    python_callable=validate_env
+)
+
+Expected output:
+
+DATACENTRE=Deakin
+ENV=TEST
+KAFKA_BROKER_INGEST=...
+
+If this fails → env file parsing is wrong.
+
+
+---
+
+Step 2 — Validate properties file parsing
+
+Next validate:
+
+/opt/telstra/omega/config/iplogs_spark.properties
+
+Add test:
+
+def validate_properties():
+    env_vars = load_env_file("/opt/telstra/omega/omega-common-files/env_subscriber")
+
+    props = load_properties(
+        "/opt/telstra/omega/config/iplogs_spark.properties",
+        env_vars
+    )
+
+    print("Resolved Spark Properties:")
+    for k,v in props.items():
+        print(f"{k} = {v}")
+
+Expected output example:
+
+spark.kafka.topic.input=OMEGA-TEST-IPLOGS-REQUEST
+spark.kafka.group=omega-irqf-iplogs.test.2
+
+This step ensures variable substitution works.
+
+Example substitution:
+
+${ENV}
+${DATACENTRE}
+
+
+---
+
+Step 3 — Validate Spark conf dictionary
+
+Now print the final spark_conf before SparkSubmitOperator.
+
+Add:
+
+def validate_spark_conf():
+    env_vars = load_env_file("/opt/telstra/omega/omega-common-files/env_subscriber")
+
+    spark_conf = load_properties(
+        "/opt/telstra/omega/config/iplogs_spark.properties",
+        env_vars
+    )
+
+    spark_conf["spark.yarn.queue"] = "query"
+
+    print("Final Spark Conf:")
+    for k,v in spark_conf.items():
+        print(f"{k}={v}")
+
+This ensures your 40 configs are loaded correctly.
+
+
+---
+
+Step 4 — Validate JAR visibility
+
+Before submitting Spark job we check if all jars exist.
+
+Example paths from your DAG:
+
+/opt/telstra/omega/internetrequestquery/current/irqf.jar
+/app/hbase/hbase/lib/*
+
+Add validation task:
+
+import os
+
+def validate_jars():
+    jar = "/opt/telstra/omega/internetrequestquery/current/irqf.jar"
+
+    if not os.path.exists(jar):
+        raise Exception(f"Jar missing: {jar}")
+
+    print("Jar exists:", jar)
+
+
+---
+
+Step 5 — Validate files passed to Spark
+
+Your DAG passes:
+
+log4j properties
+driver.properties
+hbase-site.xml
+
+Validate:
+
+def validate_files():
+
+    files = [
+        "/opt/telstra/omega/omega-common-files/log4j_irqf/irqf-IPLOGS-log4j-executor.properties",
+        "/opt/hbase/conf/hbase-site.xml"
+    ]
+
+    for f in files:
+        if not os.path.exists(f):
+            raise Exception(f"Missing file: {f}")
+        print("OK:",f)
+
+
+---
+
+Step 6 — Run lightweight Spark job with your configs
+
+Now we test SparkSubmitOperator with your configs but not your jar.
+
+Use SparkPi again but with your env + conf.
+
+SparkSubmitOperator(
+    task_id="spark_conf_validation",
+
+    conn_id="spark_default",
+
+    application="/app/spark/spark3/examples/jars/spark-examples*.jar",
+
+    java_class="org.apache.spark.examples.SparkPi",
+
+    deploy_mode="cluster",
+
+    conf=spark_conf,
+
+    env_vars=env_vars,
+
+    application_args=["10"]
+)
+
+If this works → your Spark configuration is safe.
+
+
+---
+
+Step 7 — Validate your jar loads
+
+Now test your jar but not streaming job.
+
+Run simple class inside jar if available.
+
+Example:
+
+--class com.telstra.omega.process.OmegaProcessRequest
+
+but run with safe parameters.
+
+
+---
+
+Final validation pipeline DAG
+
+Structure should look like:
+
+validate_env_file
+        ↓
+validate_properties
+        ↓
+validate_spark_conf
+        ↓
+validate_files
+        ↓
+validate_jars
+        ↓
+spark_conf_validation
+        ↓
+streaming_job
+
+
+---
+
+Why this approach works
+
+This isolates failures to layers:
+
+Layer	What fails
+
+ENV parsing	env file issue
+properties parsing	variable substitution
+Spark conf	incorrect config
+files	missing dependencies
+Spark cluster	Yarn integration
+Jar loading	classpath problem
+
+
+
+---
+
+Next step (very useful)
+
+After this stage, I can show you a very powerful production pattern used by large Spark platforms:
+
+"Self-diagnosing Spark DAG"
+
+It automatically prints:
+
+• resolved env vars
+• Spark classpath
+• Hadoop classpath
+• loaded jars
+
+before running the job.
+
+It makes debugging 10x easier for operations teams.
